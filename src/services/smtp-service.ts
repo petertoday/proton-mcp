@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import nodemailer, { type SentMessageInfo, type Transporter } from "nodemailer";
+import nodemailer, { type SMTPSentMessageInfo as SentMessageInfo, type Transporter } from "nodemailer";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import sanitizeHtml from "sanitize-html";
 import type { ProtonMailConfig, SendEmailInput } from "../types/index.js";
@@ -48,7 +48,7 @@ export function applySignature(
 export class SendNotAttemptedError extends Error {}
 
 export class SMTPService {
-  private transporter?: Transporter;
+  private transporter?: Transporter<SentMessageInfo>;
 
   constructor(private readonly config: ProtonMailConfig) {}
 
@@ -109,7 +109,7 @@ export class SMTPService {
     this.transporter = undefined;
   }
 
-  private getTransporter(): Transporter {
+  private getTransporter(): Transporter<SentMessageInfo> {
     if (!this.transporter) {
       const host = this.config.smtp.host.trim().toLowerCase();
       const isLocalhost = host === "127.0.0.1" || host === "localhost" || host === "::1";
