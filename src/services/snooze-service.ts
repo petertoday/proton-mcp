@@ -7,7 +7,7 @@ import { ensureAccountIdentityMatches } from "../utils/account-identity.js";
 import { isProcessAlive, withFileLock } from "../utils/file-lock.js";
 import { parseEmailId } from "../utils/helpers.js";
 import { logger, type Logger } from "../utils/logger.js";
-import { ensureMailboxWriteAllowed } from "../utils/runtime-policy.js";
+import { ensureEmailActionAllowed } from "../utils/runtime-policy.js";
 import { SimpleIMAPService } from "./simple-imap-service.js";
 
 // Same persistence pattern as DeliveryQueueService/DraftStoreService: atomic
@@ -36,6 +36,9 @@ const TERMINAL_RECORD_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 // to SNOOZE_WAKE_TIMEOUT_MS, since a live owner should resolve "waking"
 // within that bound.
 const RECOVERY_STALE_MS = 5 * 60 * 1000;
+
+// Policy can be restored later; a denial is not a failed IMAP move.
+class SnoozePolicyError extends Error {}
 
 interface SnoozeFile {
   version: number;
@@ -182,10 +185,14 @@ export class SnoozeService {
     try {
       // Re-check runtime policy at wake time, not just at snooze-creation
       // time: the item may have been snoozed while writes were allowed, then
-      // the server restarted into read-only mode (or a config change
-      // disabled mailbox writes) before it came due. Mirrors
-      // DeliveryQueueService's ensureSendAllowed() fire-time re-check.
-      ensureMailboxWriteAllowed(this.config.runtime);
+      // the server restarted into read-only mode or lost archive permission
+      // before it came due. Match snooze_email/cancel_snooze, as queued
+      // sends re-check ensureSendAllowed() at fire time too.
+      try {
+        ensureEmailActionAllowed(this.config.runtime, "archive");
+      } catch (error) {
+        throw new SnoozePolicyError(error instanceof Error ? error.message : String(error), { cause: error });
+      }
       // No bound here used to mean one wedged move (same shared IMAP
       // connection, same churn from the perpetual IDLE watcher) silently
       // stalled every other pending snooze indefinitely — checkDue() only
@@ -289,12 +296,14 @@ export class SnoozeService {
           const record = store.items[item.id];
           if (record && record.status === "pending") {
             record.failureReason = error instanceof Error ? error.message : String(error);
-            record.failureCount = (record.failureCount ?? 0) + 1;
-            // Cap retries — e.g. the email was moved or deleted before
-            // wakeAt, so moveEmail will never succeed. Without this, checkDue
-            // would retry the same doomed wake every 15s forever.
-            if (record.failureCount >= MAX_WAKE_FAILURES) {
-              record.status = "failed";
+            if (!(error instanceof SnoozePolicyError)) {
+              record.failureCount = (record.failureCount ?? 0) + 1;
+              // Cap retries — e.g. the email was moved or deleted before
+              // wakeAt, so moveEmail will never succeed. Without this, checkDue
+              // would retry the same doomed wake every 15s forever.
+              if (record.failureCount >= MAX_WAKE_FAILURES) {
+                record.status = "failed";
+              }
             }
             await this.save(store);
           }

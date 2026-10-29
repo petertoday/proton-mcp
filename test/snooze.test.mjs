@@ -19,7 +19,7 @@ function createConfig(dataDir) {
       readOnly: false,
       allowSend: true,
       allowRemoteDraftSync: true,
-      allowedActions: [],
+      allowedActions: ["archive"],
       startupSync: false,
       autoSyncFolder: "INBOX",
       autoSyncFull: false,
@@ -110,6 +110,52 @@ test("checkDue wakes a due snooze by moving it back to the original folder, only
     assert.equal(imap.moves.length, 2);
   });
 });
+
+for (const restriction of [
+  { name: "archive permission revoked", runtime: { allowedActions: ["mark_read"] }, error: /archive is disabled/ },
+  { name: "all actions revoked", runtime: { allowedActions: [] }, error: /archive is disabled/ },
+  { name: "read-only mode", runtime: { readOnly: true }, error: /read-only mode/ },
+]) {
+  for (const resume of ["wake", "cancel"]) {
+    test(`pending snoozes resume via ${resume} after ${restriction.name} is lifted`, async (t) => {
+      await withTempDir(async (dataDir) => {
+        const config = createConfig(dataDir);
+        const imap = fakeImap();
+        const original = new SnoozeService(config, imap);
+        const now = Date.now();
+        const record = await original.snooze("INBOX::42", new Date(now + 1_000).toISOString());
+        assert.equal(imap.moves.length, 1, "initial authorized snooze-out move");
+
+        const restricted = new SnoozeService({
+          ...config,
+          runtime: { ...config.runtime, ...restriction.runtime },
+        }, imap);
+        t.mock.method(Date, "now", () => now + 2_000);
+        for (let tick = 0; tick < 7; tick++) {
+          assert.deepEqual(await restricted.checkDue(), { woken: 0, failed: 1 });
+        }
+        const pending = await restricted.get(record.id);
+        assert.equal(pending.status, "pending", "policy rejection must not exhaust move retries");
+        assert.equal(pending.failureCount, undefined);
+        assert.match(pending.failureReason, restriction.error);
+        assert.equal(imap.moves.length, 1, "scheduled wake must not bypass the current policy");
+        await assert.rejects(restricted.cancel(record.id), restriction.error);
+        assert.equal(imap.moves.length, 1, "cancel must not bypass the current policy");
+
+        const allowed = new SnoozeService(config, imap);
+        if (resume === "wake") {
+          assert.deepEqual(await allowed.checkDue(), { woken: 1, failed: 0 });
+        } else {
+          await allowed.cancel(record.id);
+        }
+        assert.equal((await allowed.get(record.id)).status, resume === "wake" ? "woken" : "canceled");
+        assert.equal(imap.moves.length, 2, "restoring permission permits exactly one wake");
+        await allowed.checkDue();
+        assert.equal(imap.moves.length, 2);
+      });
+    });
+  }
+}
 
 test("checkDue leaves future snoozes alone", async () => {
   await withTempDir(async (dataDir) => {
